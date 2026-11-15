@@ -4,17 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       win:          { description: "Windows (10 hoặc 11)", default: "11" }
-      edition:      { description: "Edition", default: "Windows 11 Home/Pro/Edu" }
+      edition:      { description: "Edition cho Fido", default: "Windows 11 Home/Pro/Edu" }
+      edition_name: { description: "Tên edition giữ lại trong ISO (đúng chính tả)", default: "Windows 11 Pro" }
       lang:         { description: "Ngôn ngữ", default: "English" }
       iso_url:      { description: "(Tuỳ chọn) link ISO trực tiếp, bỏ qua Fido", default: "" }
       oem_name:     { description: "Tên hãng hiện trong System Properties", default: "MyWindows" }
       user:         { description: "Tên tài khoản (không mật khẩu)", default: "admin" }
       tat_defender: { description: "Tắt Windows Defender để tiết kiệm RAM (true/false)", default: "false" }
+      xoa_winre:    { description: "Xoá WinRE để ISO nhẹ hơn ~500MB, mất Reset/Recovery (true/false)", default: "false" }
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 330
     steps:
       - name: Tải ISO
         shell: pwsh
@@ -41,6 +43,25 @@ jobs:
           Get-ChildItem C:\work\iso -Recurse -File | ForEach-Object { $_.IsReadOnly = $false }
           $global:LASTEXITCODE = 0
 
+      - name: Chọn edition và tách thành 1 index
+        shell: pwsh
+        run: |
+          $name = "${{ inputs.edition_name }}"
+          $wim = "C:\work\iso\sources\install.wim"
+          $esd = "C:\work\iso\sources\install.esd"
+          $src = if (Test-Path $wim) { $wim } else { $esd }
+          $idx = $null; $cur = $null
+          foreach ($l in (dism /Get-WimInfo /WimFile:$src)) {
+            if ($l -match '^Index : (\d+)') { $cur = $matches[1] }
+            elseif ($l -match '^Name : (.+)$' -and $matches[1].Trim() -eq $name) { $idx = $cur }
+          }
+          if (-not $idx) { Write-Warning "Không thấy '$name', dùng Index 1"; $idx = 1 }
+          Write-Host "Dùng Index $idx"
+          dism /Export-Image /SourceImageFile:$src /SourceIndex:$idx /DestinationImageFile:C:\work\one.wim /Compress:fast
+          if ($LASTEXITCODE -ne 0) { throw "Export lỗi" }
+          Remove-Item $src -Force
+          Move-Item C:\work\one.wim $wim -Force
+
       - name: Tải Chrome và tạo script sau cài đặt
         shell: pwsh
         run: |
@@ -64,11 +85,6 @@ jobs:
         run: |
           $wim = "C:\work\iso\sources\install.wim"
           $mount = "C:\work\mount"
-          if (-not (Test-Path $wim)) {
-            dism /Export-Image /SourceImageFile:C:\work\iso\sources\install.esd /SourceIndex:1 /DestinationImageFile:$wim /Compress:max
-            Remove-Item C:\work\iso\sources\install.esd -Force
-          }
-          dism /Get-WimInfo /WimFile:$wim
           dism /Mount-Image /ImageFile:$wim /Index:1 /MountDir:$mount
 
           # ===== Gỡ hết app, chỉ giữ Store + app lõi hệ thống + framework + codec =====
@@ -116,6 +132,16 @@ jobs:
               takeown /f $f | Out-Null
               icacls $f /grant "Administrators:F" | Out-Null
               Remove-Item $f -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # ===== Xoá WinRE (tuỳ chọn) =====
+          if ("${{ inputs.xoa_winre }}" -eq "true") {
+            $re = "$mount\Windows\System32\Recovery\Winre.wim"
+            if (Test-Path $re) {
+              takeown /f $re | Out-Null
+              icacls $re /grant "Administrators:F" | Out-Null
+              Remove-Item $re -Force -ErrorAction SilentlyContinue
             }
           }
 
@@ -184,7 +210,20 @@ jobs:
           reg unload HKLM\OFFSOFT
           reg unload HKLM\OFFUSER
 
+          # ===== Dọn WinSxS (giảm dung lượng image) =====
+          dism /Image:$mount /Cleanup-Image /StartComponentCleanup /ResetBase
+
           dism /Unmount-Image /MountDir:$mount /Commit
+
+      - name: Nén install.wim thành ESD (nhỏ nhất)
+        shell: pwsh
+        run: |
+          $wim = "C:\work\iso\sources\install.wim"
+          $esd = "C:\work\iso\sources\install.esd"
+          dism /Export-Image /SourceImageFile:$wim /SourceIndex:1 /DestinationImageFile:$esd /Compress:recovery
+          if ($LASTEXITCODE -ne 0) { throw "Nén ESD lỗi" }
+          Remove-Item $wim -Force
+          Get-ChildItem C:\work\iso\sources | Where-Object { $_.Name -like "install.*" } | Format-Table Name, Length
 
       - name: Bỏ kiểm tra phần cứng (TPM, Secure Boot, RAM, CPU, ổ cứng)
         shell: pwsh
@@ -242,6 +281,7 @@ jobs:
           $efi  = "C:\work\iso\efi\microsoft\boot\efisys.bin"
           & $osc -m -o -u2 -udfver102 -bootdata:"2#p0,e,b$etfs#pEF,e,b$efi" C:\work\iso C:\work\MyWindows.iso
           if ($LASTEXITCODE -ne 0) { throw "oscdimg lỗi" }
+          "{0:N2} GB" -f ((Get-Item C:\work\MyWindows.iso).Length / 1GB) | Write-Host
 
       - name: Upload ISO
         uses: actions/upload-artifact@v4
