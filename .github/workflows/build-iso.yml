@@ -1,0 +1,252 @@
+name: Build custom Windows ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      win:          { description: "Windows (10 hoặc 11)", default: "11" }
+      edition:      { description: "Edition", default: "Windows 11 Home/Pro/Edu" }
+      lang:         { description: "Ngôn ngữ", default: "English" }
+      iso_url:      { description: "(Tuỳ chọn) link ISO trực tiếp, bỏ qua Fido", default: "" }
+      oem_name:     { description: "Tên hãng hiện trong System Properties", default: "MyWindows" }
+      user:         { description: "Tên tài khoản (không mật khẩu)", default: "admin" }
+      tat_defender: { description: "Tắt Windows Defender để tiết kiệm RAM (true/false)", default: "false" }
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - name: Tải ISO
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force C:\work | Out-Null
+          $url = "${{ inputs.iso_url }}"
+          if (-not $url) {
+            Invoke-WebRequest "https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1" -OutFile C:\work\Fido.ps1
+            $url = & C:\work\Fido.ps1 -Win "${{ inputs.win }}" -Rel Latest -Ed "${{ inputs.edition }}" -Lang "${{ inputs.lang }}" -Arch x64 -GetUrl
+          }
+          Write-Host "URL: $url"
+          Invoke-WebRequest $url -OutFile C:\work\win.iso
+
+      - name: Giải nén ISO
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:\work\iso, C:\work\mount | Out-Null
+          $img = Mount-DiskImage -ImagePath C:\work\win.iso -PassThru
+          $d = ($img | Get-Volume).DriveLetter
+          robocopy "${d}:\" C:\work\iso /E /R:1 /W:1 | Out-Null
+          Dismount-DiskImage -ImagePath C:\work\win.iso
+          Remove-Item C:\work\win.iso -Force
+          Get-ChildItem C:\work\iso -Recurse -File | ForEach-Object { $_.IsReadOnly = $false }
+          $global:LASTEXITCODE = 0
+
+      - name: Tải Chrome và tạo script sau cài đặt
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $d = 'C:\work\iso\sources\$OEM$\$$\Setup\Scripts'
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Invoke-WebRequest "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi" -OutFile "$d\chrome.msi"
+          @"
+          @echo off
+          msiexec /i "%~dp0chrome.msi" /qn /norestart
+          del /f /q "%~dp0chrome.msi"
+          net accounts /maxpwage:unlimited
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-LocalUser -Name '${{ inputs.user }}' -PasswordNeverExpires `$true"
+          wmic useraccount where "name='${{ inputs.user }}'" set passwordexpires=false
+          reg add HKLM\SYSTEM\Setup\MoSetup /v AllowUpgradesWithUnsupportedTPMOrCPU /t REG_DWORD /d 1 /f
+          powercfg -h off
+          "@ | Set-Content "$d\SetupComplete.cmd" -Encoding ASCII
+
+      - name: Sửa install.wim
+        shell: pwsh
+        run: |
+          $wim = "C:\work\iso\sources\install.wim"
+          $mount = "C:\work\mount"
+          if (-not (Test-Path $wim)) {
+            dism /Export-Image /SourceImageFile:C:\work\iso\sources\install.esd /SourceIndex:1 /DestinationImageFile:$wim /Compress:max
+            Remove-Item C:\work\iso\sources\install.esd -Force
+          }
+          dism /Get-WimInfo /WimFile:$wim
+          dism /Mount-Image /ImageFile:$wim /Index:1 /MountDir:$mount
+
+          # ===== Gỡ hết app, chỉ giữ Store + app lõi hệ thống + framework + codec =====
+          $keep = "VCLibs","NET.Native","UI.Xaml","WindowsAppRuntime","WindowsStore","StorePurchaseApp",
+            "DesktopAppInstaller","SecHealthUI","WindowsNotepad","Paint","WindowsCalculator","Windows.Photos",
+            "ScreenSketch","WindowsTerminal","WindowsCamera","WindowsAlarms","WindowsSoundRecorder",
+            "HEIFImageExtension","HEVCVideoExtension","VP9VideoExtensions","WebpImageExtension",
+            "WebMediaExtensions","RawImageExtension","AV1VideoExtension"
+          $pk = dism /Image:$mount /Get-ProvisionedAppxPackages | Select-String "PackageName" | ForEach-Object { ($_ -split ":\s*")[1].Trim() }
+          foreach ($p in $pk) {
+            $giu = $false
+            foreach ($k in $keep) { if ($p -like "*$k*") { $giu = $true; break } }
+            if (-not $giu) { dism /Image:$mount /Remove-ProvisionedAppxPackage /PackageName:$p | Out-Null }
+          }
+
+          # ===== Gỡ Microsoft Edge (giữ WebView2) =====
+          $edgePaths = @(
+            "$mount\Program Files (x86)\Microsoft\Edge",
+            "$mount\Program Files (x86)\Microsoft\EdgeCore",
+            "$mount\Program Files (x86)\Microsoft\EdgeUpdate",
+            "$mount\Program Files (x86)\Microsoft\Temp",
+            "$mount\ProgramData\Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk",
+            "$mount\Users\Default\Desktop\Microsoft Edge.lnk",
+            "$mount\Users\Public\Desktop\Microsoft Edge.lnk"
+          )
+          foreach ($p in $edgePaths) {
+            if (Test-Path $p) {
+              takeown /f "$p" /r /d y | Out-Null
+              icacls "$p" /grant "Administrators:F" /t /c | Out-Null
+              Remove-Item "$p" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          Get-ChildItem "$mount\Windows\System32\Tasks" -Filter "MicrosoftEdge*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+          Get-ChildItem "$mount\Windows\SystemApps" -Filter "Microsoft.MicrosoftEdge*" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              takeown /f $_.FullName /r /d y | Out-Null
+              icacls $_.FullName /grant "Administrators:F" /t /c | Out-Null
+              Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
+          # ===== Xoá OneDrive =====
+          foreach ($f in "$mount\Windows\System32\OneDriveSetup.exe","$mount\Windows\SysWOW64\OneDriveSetup.exe") {
+            if (Test-Path $f) {
+              takeown /f $f | Out-Null
+              icacls $f /grant "Administrators:F" | Out-Null
+              Remove-Item $f -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          # ===== Registry offline (branding + giảm RAM) =====
+          reg load HKLM\OFFSYS  "$mount\Windows\System32\config\SYSTEM"
+          reg load HKLM\OFFSOFT "$mount\Windows\System32\config\SOFTWARE"
+          reg load HKLM\OFFUSER "$mount\Users\Default\NTUSER.DAT"
+
+          # Branding
+          reg add "HKLM\OFFSOFT\Microsoft\Windows\CurrentVersion\OEMInformation" /v Manufacturer /t REG_SZ /d "${{ inputs.oem_name }}" /f
+          reg add "HKLM\OFFSOFT\Microsoft\Windows\CurrentVersion\OEMInformation" /v Model /t REG_SZ /d "${{ inputs.oem_name }} Edition" /f
+          reg add "HKLM\OFFSOFT\Microsoft\Windows\CurrentVersion\Policies\System" /v EnableFirstLogonAnimation /t REG_DWORD /d 0 /f
+
+          # Driver: giữ Windows Update tự cài driver
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\WindowsUpdate" /v ExcludeWUDriversInQualityUpdate /t REG_DWORD /d 0 /f
+
+          # Chặn Edge tự cài lại
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\EdgeUpdate" /v InstallDefault /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\EdgeUpdate" /v "Install{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}" /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\EdgeUpdate" /v "Update{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}" /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFSOFT\Microsoft\EdgeUpdate" /v DoNotUpdateToEdgeWithChromium /t REG_DWORD /d 1 /f
+
+          # Tắt service không cần (Start=4)
+          $svc = "DiagTrack","dmwappushservice","SysMain","WSearch","MapsBroker","RetailDemo","Fax",
+            "WerSvc","lfsvc","XblAuthManager","XblGameSave","XboxGipSvc","XboxNetApiSvc",
+            "wisvc","PhoneSvc","SEMgrSvc","WalletService","icssvc","SharedRealitySvc",
+            "diagnosticshub.standardcollector.service"
+          if ("${{ inputs.tat_defender }}" -eq "true") {
+            $svc += "WinDefend","WdNisSvc","WdNisDrv","WdFilter","WdBoot","Sense"
+          }
+          foreach ($s in $svc) {
+            $k = "HKLM:\OFFSYS\ControlSet001\Services\$s"
+            if (Test-Path $k) { Set-ItemProperty $k -Name Start -Value 4 -Type DWord -ErrorAction SilentlyContinue }
+          }
+
+          # Policy toàn máy
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\CloudContent" /v DisableWindowsConsumerFeatures /t REG_DWORD /d 1 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\CloudContent" /v DisableSoftLanding /t REG_DWORD /d 1 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\DataCollection" /v AllowTelemetry /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\WindowsCopilot" /v TurnOffWindowsCopilot /t REG_DWORD /d 1 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Dsh" /v AllowNewsAndInterests /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\Windows Feeds" /v EnableFeeds /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\AppPrivacy" /v LetAppsRunInBackground /t REG_DWORD /d 2 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\OneDrive" /v DisableFileSyncNGSC /t REG_DWORD /d 1 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\GameDVR" /v AllowGameDVR /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\Windows Search" /v AllowCortana /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\System" /v EnableActivityFeed /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFSOFT\Policies\Microsoft\Windows\WindowsAI" /v DisableAIDataAnalysis /t REG_DWORD /d 1 /f
+
+          # User mặc định: tắt hiệu ứng, Widgets, Chat, gợi ý, OneDrive tự chạy
+          reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f
+          reg add "HKLM\OFFUSER\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f
+          reg add "HKLM\OFFUSER\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f
+          reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarDa /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarMn /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\Search" /v SearchboxTaskbarMode /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications" /v GlobalUserDisabled /t REG_DWORD /d 1 /f
+          reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SilentInstalledAppsEnabled /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContent-338388Enabled /t REG_DWORD /d 0 /f
+          reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContent-338389Enabled /t REG_DWORD /d 0 /f
+          reg delete "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\Run" /v OneDriveSetup /f
+
+          [gc]::Collect(); Start-Sleep 3
+          reg unload HKLM\OFFSYS
+          reg unload HKLM\OFFSOFT
+          reg unload HKLM\OFFUSER
+
+          dism /Unmount-Image /MountDir:$mount /Commit
+
+      - name: Bỏ kiểm tra phần cứng (TPM, Secure Boot, RAM, CPU, ổ cứng)
+        shell: pwsh
+        run: |
+          Set-Content C:\work\iso\sources\appraiserres.dll -Value $null
+
+      - name: Thêm autounattend.xml
+        shell: pwsh
+        run: |
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+           <settings pass="windowsPE">
+            <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+             <RunSynchronous>
+              <RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+              <RunSynchronousCommand wcm:action="add"><Order>2</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+              <RunSynchronousCommand wcm:action="add"><Order>3</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+              <RunSynchronousCommand wcm:action="add"><Order>4</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+              <RunSynchronousCommand wcm:action="add"><Order>5</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+             </RunSynchronous>
+            </component>
+           </settings>
+           <settings pass="oobeSystem">
+            <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+             <OOBE>
+              <HideEULAPage>true</HideEULAPage>
+              <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+              <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+              <ProtectYourPC>3</ProtectYourPC>
+             </OOBE>
+             <UserAccounts><LocalAccounts>
+              <LocalAccount wcm:action="add">
+               <Name>${{ inputs.user }}</Name>
+               <Group>Administrators</Group>
+               <Password><Value></Value><PlainText>true</PlainText></Password>
+              </LocalAccount>
+             </LocalAccounts></UserAccounts>
+             <AutoLogon>
+              <Enabled>true</Enabled>
+              <Username>${{ inputs.user }}</Username>
+              <LogonCount>1</LogonCount>
+             </AutoLogon>
+            </component>
+           </settings>
+          </unattend>
+          "@ | Set-Content C:\work\iso\autounattend.xml -Encoding UTF8
+
+      - name: Đóng gói ISO
+        shell: pwsh
+        run: |
+          choco install windows-adk-oscdimg -y --no-progress
+          $osc = (Get-ChildItem "C:\Program Files (x86)\Windows Kits" -Recurse -Filter oscdimg.exe | Select-Object -First 1).FullName
+          $etfs = "C:\work\iso\boot\etfsboot.com"
+          $efi  = "C:\work\iso\efi\microsoft\boot\efisys.bin"
+          & $osc -m -o -u2 -udfver102 -bootdata:"2#p0,e,b$etfs#pEF,e,b$efi" C:\work\iso C:\work\MyWindows.iso
+          if ($LASTEXITCODE -ne 0) { throw "oscdimg lỗi" }
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyWindows-iso
+          path: C:\work\MyWindows.iso
+          compression-level: 0
+          retention-days: 3
