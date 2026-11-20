@@ -18,6 +18,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 330
     steps:
+      - uses: actions/checkout@v4
+
       - name: Tải ISO
         shell: pwsh
         run: |
@@ -205,6 +207,48 @@ jobs:
           reg add "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" /v SubscribedContent-338389Enabled /t REG_DWORD /d 0 /f
           reg delete "HKLM\OFFUSER\Software\Microsoft\Windows\CurrentVersion\Run" /v OneDriveSetup /f
 
+          # ===== Logo / ảnh nền (đặt file trong assets/logo.png và assets/wallpaper.jpg) =====
+          $assets = "$env:GITHUB_WORKSPACE\assets"
+          Add-Type -AssemblyName System.Drawing
+          function Take($p) { takeown /f "$p" | Out-Null; icacls "$p" /grant "Administrators:F" | Out-Null }
+          function Resize-Img($src, $dst, $w, $h) {
+            $img = [System.Drawing.Image]::FromFile($src)
+            $bmp = New-Object System.Drawing.Bitmap($w, $h)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.InterpolationMode = 'HighQualityBicubic'
+            $g.DrawImage($img, 0, 0, $w, $h)
+            $fmt = switch ([IO.Path]::GetExtension($dst).ToLower()) { '.png' {'Png'} '.bmp' {'Bmp'} default {'Jpeg'} }
+            $bmp.Save($dst, [System.Drawing.Imaging.ImageFormat]::$fmt)
+            $g.Dispose(); $bmp.Dispose(); $img.Dispose()
+          }
+
+          if (Test-Path "$assets\logo.png") {
+            # Ảnh user mặc định
+            $up = "$mount\ProgramData\Microsoft\User Account Pictures"
+            Get-ChildItem $up -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(user|guest)' } | ForEach-Object {
+              $sz = 448
+              if ($_.Name -match '-(\d+)\.') { $sz = [int]$matches[1] }
+              Take $_.FullName
+              Resize-Img "$assets\logo.png" $_.FullName $sz $sz
+            }
+            # Logo OEM trong Settings > About
+            Resize-Img "$assets\logo.png" "$mount\Windows\System32\oemlogo.bmp" 120 120
+            reg add "HKLM\OFFSOFT\Microsoft\Windows\CurrentVersion\OEMInformation" /v Logo /t REG_SZ /d "C:\Windows\System32\oemlogo.bmp" /f
+          }
+
+          if (Test-Path "$assets\wallpaper.jpg") {
+            $wp = @("$mount\Windows\Web\Wallpaper\Windows\img0.jpg")
+            $wp += Get-ChildItem "$mount\Windows\Web\4K\Wallpaper\Windows" -File -ErrorAction SilentlyContinue | ForEach-Object FullName
+            $wp += Get-ChildItem "$mount\Windows\Web\Screen" -File -Filter "img*.jpg" -ErrorAction SilentlyContinue | ForEach-Object FullName
+            foreach ($f in $wp) {
+              if (Test-Path $f) {
+                $im = [System.Drawing.Image]::FromFile($f); $w = $im.Width; $h = $im.Height; $im.Dispose()
+                Take $f
+                Resize-Img "$assets\wallpaper.jpg" $f $w $h
+              }
+            }
+          }
+
           [gc]::Collect(); Start-Sleep 3
           reg unload HKLM\OFFSYS
           reg unload HKLM\OFFSOFT
@@ -238,6 +282,10 @@ jobs:
           <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
            <settings pass="windowsPE">
             <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+             <DynamicUpdate>
+              <Enable>false</Enable>
+              <WillShowUI>Never</WillShowUI>
+             </DynamicUpdate>
              <RunSynchronous>
               <RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
               <RunSynchronousCommand wcm:action="add"><Order>2</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
@@ -271,6 +319,38 @@ jobs:
            </settings>
           </unattend>
           "@ | Set-Content C:\work\iso\autounattend.xml -Encoding UTF8
+
+      - name: Đổi ảnh nền màn hình cài đặt (boot.wim)
+        shell: pwsh
+        run: |
+          $wp = "$env:GITHUB_WORKSPACE\assets\wallpaper.jpg"
+          if (-not (Test-Path $wp)) { Write-Host "Không có wallpaper.jpg, bỏ qua"; exit 0 }
+          Add-Type -AssemblyName System.Drawing
+          function Resize-Img($src, $dst, $w, $h) {
+            $img = [System.Drawing.Image]::FromFile($src)
+            $bmp = New-Object System.Drawing.Bitmap($w, $h)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.InterpolationMode = 'HighQualityBicubic'
+            $g.DrawImage($img, 0, 0, $w, $h)
+            $fmt = switch ([IO.Path]::GetExtension($dst).ToLower()) { '.png' {'Png'} '.bmp' {'Bmp'} default {'Jpeg'} }
+            $bmp.Save($dst, [System.Drawing.Imaging.ImageFormat]::$fmt)
+            $g.Dispose(); $bmp.Dispose(); $img.Dispose()
+          }
+          $boot = "C:\work\iso\sources\boot.wim"
+          $bm = "C:\work\bootmount"
+          New-Item -ItemType Directory -Force $bm | Out-Null
+          dism /Mount-Image /ImageFile:$boot /Index:2 /MountDir:$bm
+          $n = 0
+          Get-ChildItem "$bm\sources" -File -Filter "background*" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in '.bmp','.png','.jpg' } | ForEach-Object {
+              $im = [System.Drawing.Image]::FromFile($_.FullName); $w = $im.Width; $h = $im.Height; $im.Dispose()
+              takeown /f $_.FullName | Out-Null; icacls $_.FullName /grant "Administrators:F" | Out-Null
+              Resize-Img $wp $_.FullName $w $h
+              Write-Host "Đã thay $($_.Name) ($w x $h)"
+              $n++
+            }
+          Write-Host "Số file nền đã thay: $n"
+          dism /Unmount-Image /MountDir:$bm /Commit
 
       - name: Đóng gói ISO
         shell: pwsh
